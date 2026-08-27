@@ -1,4 +1,3 @@
-import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { stdin as processStdin, stderr as processStderr, stdout as processStdout } from 'node:process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -306,10 +305,13 @@ export async function runDevSpaceMcpRunner(
 
       const state = classifyAgentState(agent);
       if (state === 'completed') {
-        const summary =
-          findStringByKeys(agent, ['summary', 'resultSummary', 'result_summary', 'message']) ??
-          lastReply ||
-          'DevSpace ChatGPT Web task completed.';
+        const reportedSummary = findStringByKeys(agent, [
+          'summary',
+          'resultSummary',
+          'result_summary',
+          'message',
+        ]);
+        const summary = reportedSummary ?? (lastReply || 'DevSpace ChatGPT Web task completed.');
         emit(io, {
           protocol: CHATGPT_WEB_BRIDGE_PROTOCOL,
           type: 'done',
