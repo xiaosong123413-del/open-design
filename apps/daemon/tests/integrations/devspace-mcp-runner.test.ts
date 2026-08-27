@@ -31,6 +31,16 @@ describe('DevSpace MCP runner config', () => {
       resolveDevSpaceMcpRunnerConfig({ OD_DEVSPACE_MCP_COMMAND: 'devspace-mcp' }),
     ).toThrow(/OD_DEVSPACE_RUN_ID/u);
   });
+
+  it('rejects non-array MCP args', () => {
+    expect(() =>
+      resolveDevSpaceMcpRunnerConfig({
+        OD_DEVSPACE_MCP_COMMAND: 'devspace-mcp',
+        OD_DEVSPACE_MCP_ARGS: '"--stdio"',
+        OD_DEVSPACE_RUN_ID: 'run-123',
+      }),
+    ).toThrow(/OD_DEVSPACE_MCP_ARGS must be a JSON string array/u);
+  });
 });
 
 describe('DevSpace MCP bridge request parsing', () => {
