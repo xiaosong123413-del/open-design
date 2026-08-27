@@ -11,8 +11,12 @@ import { CHATGPT_WEB_BRIDGE_PROTOCOL } from './protocol.js';
 
 const BRIDGE_CLI_VERSION = '0.1.0';
 
+interface CliInput extends NodeJS.ReadableStream {
+  isTTY?: boolean;
+}
+
 interface CliIo {
-  stdin: NodeJS.ReadableStream;
+  stdin: CliInput;
   stdout: NodeJS.WritableStream;
   stderr: NodeJS.WritableStream;
 }
