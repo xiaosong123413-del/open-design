@@ -1,8 +1,6 @@
 # ChatGPT Web bridge
 
-The experimental `od-chatgpt-web` CLI is the stage-2 integration boundary between OpenDesign and a DevSpace-owned ChatGPT Web session.
-
-It does **not** call the OpenAI API and it does **not** automate `chatgpt.com` directly. OpenDesign talks to one local bridge process; DevSpace remains responsible for browser/session ownership and for adapting ChatGPT Web to the runner protocol below.
+`od-chatgpt-web` is the Stage 2 boundary between OpenDesign and a DevSpace-owned ChatGPT Web session. It does not call the OpenAI API and does not automate `chatgpt.com` directly.
 
 ## Architecture
 
@@ -13,14 +11,17 @@ OpenDesign / shell
        v
 od-chatgpt-web
        |
-       | one JSON request on stdin
-       | NDJSON events on stdout
+       | bundled runner (automatic)
        v
 od-devspace-chatgpt-runner
        |
-       | MCP stdio
+       | MCP Streamable HTTP (preferred)
+       | or explicit stdio fallback
        v
-DevSpace persistent run
+DevSpace desktop local bridge
+       |
+       v
+persistent DevSpace run
        |
        v
 ChatGPT Web child session + DevSpace tools
@@ -31,99 +32,86 @@ ChatGPT Web child session + DevSpace tools
        +--> return completion state
 ```
 
-This stage intentionally keeps the bridge separate from the OpenDesign Agent Picker. Native picker integration is a later product step.
+The public Devspace product documentation describes a Windows desktop app with a local bridge service and an MCP connection used by ChatGPT. The OpenDesign integration therefore treats the local bridge URL as the primary transport instead of assuming a separate `devspace-mcp` executable exists.
 
 ## Build
-
-From the repository root:
 
 ```bash
 pnpm --filter @open-design/daemon build
 ```
 
-The workspace exposes both stage-2 binaries:
+The daemon package exposes:
 
 ```bash
 pnpm exec od-chatgpt-web --version
 pnpm exec od-devspace-chatgpt-runner --version
 ```
 
-## One-time DevSpace setup
+`od-chatgpt-web` automatically launches the bundled `od-devspace-chatgpt-runner`; `OD_CHATGPT_WEB_RUNNER` is only needed when overriding that runner.
 
-The bundled runner uses DevSpace's MCP tools `devspace_agent_spawn` and `devspace_agent_get`. It deliberately does not create a DevSpace goal/run on its own because run creation is a user-controlled DevSpace action.
+## One-time project binding
 
-Create or choose one persistent DevSpace run that is already bound to the project workspace, then record its run id. That is the one-time setup for the project. Subsequent design prompts can reuse the same run and spawn a fresh ChatGPT Web implementer session automatically.
+Two pieces of DevSpace state are required for Stage 2:
 
-The local DevSpace MCP server command must also be available. Configure it as a command plus an argument array; do not put browser cookies or ChatGPT credentials in these values.
+1. the local MCP bridge URL exposed by DevSpace desktop;
+2. one persistent DevSpace run already bound to the intended project workspace.
 
-```bash
-export OD_DEVSPACE_MCP_COMMAND=/path/to/devspace-mcp
-export OD_DEVSPACE_MCP_ARGS='["--stdio"]'
-export OD_DEVSPACE_RUN_ID='<existing-run-id>'
-```
-
-Optional timing controls:
+They can be supplied as environment configuration:
 
 ```bash
-export OD_DEVSPACE_POLL_MS=2000
-export OD_DEVSPACE_TIMEOUT_MS=1800000
+export OD_DEVSPACE_MCP_URL='<DevSpace desktop local MCP URL>'
+export OD_DEVSPACE_RUN_ID='<persistent run id>'
 ```
 
-The runner verifies that the connected MCP server exposes `devspace_agent_spawn` and `devspace_agent_get` before starting a design task.
-
-## Configure OpenDesign to use the bundled DevSpace runner
-
-After building the daemon package, point the outer bridge at the bundled runner:
-
-```bash
-export OD_CHATGPT_WEB_RUNNER="$(pwd)/apps/daemon/bin/od-devspace-chatgpt-runner.mjs"
-export OD_CHATGPT_WEB_RUNNER_ARGS='[]'
-```
-
-Check the outer bridge before running a design task:
-
-```bash
-pnpm exec od-chatgpt-web doctor
-pnpm exec od-chatgpt-web doctor --json
-```
-
-## Run a design task
-
-Prompt as an argument:
+or directly on one invocation:
 
 ```bash
 pnpm exec od-chatgpt-web run \
   --cwd /path/to/project \
-  --prompt "Design a settings page and verify it in the browser preview."
+  --mcp-url '<DevSpace desktop local MCP URL>' \
+  --devspace-run-id '<persistent run id>' \
+  --prompt 'Design a settings page and verify it in the browser preview.'
 ```
 
-Prompt through stdin, which is the preferred form for long agent prompts:
+The MCP URL is intentionally not guessed. OpenDesign must use the endpoint actually exposed by the installed DevSpace desktop build.
 
-```bash
-cat prompt.md | pnpm exec od-chatgpt-web run --cwd /path/to/project
-```
-
-Images can be attached as project-local or absolute paths:
+If a DevSpace build explicitly exposes an MCP stdio command instead of a local URL, use the compatibility path:
 
 ```bash
 pnpm exec od-chatgpt-web run \
   --cwd /path/to/project \
-  --image ./reference.png \
-  --prompt "Match this reference while preserving the existing design system."
+  --mcp-command /path/to/explicit-mcp-server \
+  --mcp-arg=--stdio \
+  --devspace-run-id '<persistent run id>' \
+  --prompt 'Design a dashboard.'
 ```
 
-For each invocation the bundled runner:
+## Normal design use
 
-1. connects to the configured DevSpace MCP server over stdio;
-2. checks for the required DevSpace child-session tools;
-3. spawns one `implementer` child session inside the configured persistent run with `workspaceMode: shared`;
-4. asks the child to implement the requested change, run relevant validation, and inspect visible UI in a real browser preview when practical;
-5. polls the child session and streams new observed replies back as bridge `text` events;
-6. emits `done` or `error` when DevSpace reports terminal state.
+After the project binding is stored by the calling OpenDesign surface, normal use should collapse to:
 
-The persistent run must be bound to the intended project. The request `cwd` is included in the child task for verification and context; it does not silently rebind the DevSpace run to another repository.
+```bash
+pnpm exec od-chatgpt-web run \
+  --cwd /path/to/project \
+  --prompt 'Make the billing page feel more like Linear and verify the preview.'
+```
 
-## Runner protocol
+The product UI should own the one-time MCP URL / DevSpace run binding. Users should not be asked for those values on every design prompt.
+
+## What the bundled runner does
+
+For each invocation it:
+
+1. connects to DevSpace via the configured local MCP URL, or explicit stdio fallback;
+2. calls `tools/list` and requires `devspace_agent_spawn` plus `devspace_agent_get`;
+3. inspects the live `devspace_agent_spawn` input schema before adding optional arguments, avoiding hard-coded optional fields that a different DevSpace build may not support;
+4. starts an `implementer` ChatGPT Web child session inside the bound persistent run;
+5. polls the child session, streaming new observed replies as bridge `text` events;
+6. emits `done` or `error` when DevSpace reaches terminal state.
+
+The request `cwd` is included in the child task for verification and context. It does not silently rebind a DevSpace run to another project.
+
+## Protocol
 
 Protocol identifier:
 
@@ -131,7 +119,7 @@ Protocol identifier:
 od-chatgpt-web/1
 ```
 
-The bridge starts the configured runner without a shell, sets its working directory to the requested project directory, and writes exactly one JSON line to runner stdin.
+The outer bridge sends one JSON request to the bundled runner and receives newline-delimited JSON events.
 
 Example request:
 
@@ -139,62 +127,58 @@ Example request:
 {"protocol":"od-chatgpt-web/1","type":"run","requestId":"<uuid>","cwd":"/project","prompt":"Design a dashboard","imagePaths":[]}
 ```
 
-The runner writes newline-delimited JSON events to stdout. Every event must contain the same `protocol` and `requestId`.
-
-Supported event types are:
-
-- `session` — a ChatGPT/DevSpace child session was acquired.
-- `status` — progress information.
-- `text` — the latest observed child-session reply changed.
-- `tool` — a runner may surface a DevSpace tool start/result.
-- `artifact` — a runner may surface a project file create/update/delete.
-- `preview` — a runner may surface a browser preview URL.
-- `done` — successful terminal event.
-- `error` — failed terminal event.
-
-Example event stream:
-
-```jsonl
-{"protocol":"od-chatgpt-web/1","type":"status","requestId":"<uuid>","message":"Connecting to DevSpace MCP"}
-{"protocol":"od-chatgpt-web/1","type":"session","requestId":"<uuid>","sessionId":"agent-1"}
-{"protocol":"od-chatgpt-web/1","type":"text","requestId":"<uuid>","text":"Implemented the settings page and checked the preview."}
-{"protocol":"od-chatgpt-web/1","type":"done","requestId":"<uuid>","summary":"Settings page updated and validated."}
-```
-
-The runner may write diagnostics to stderr. The bridge forwards them to its own stderr and never mixes them into the NDJSON stdout stream.
-
-A runner must emit a terminal `done` or `error` event before exiting. Exiting without a terminal event is treated as a bridge failure.
+Supported event types are `session`, `status`, `text`, `tool`, `artifact`, `preview`, `done`, and `error`.
 
 ## Security boundary
 
-The bridge intentionally avoids shell command strings. It spawns only the configured runner executable plus explicit argument-array entries. The bundled runner similarly uses MCP stdio with an explicit command/argument array. DevSpace remains the authority for filesystem, command, browser, authentication, permission, and ChatGPT Web session controls.
+OpenDesign never needs ChatGPT cookies, browser session tokens, or an OpenAI API key for this path. DevSpace remains responsible for ChatGPT session ownership, local permission gates, filesystem access, commands, browser inspection, and authentication.
 
-Do not put ChatGPT cookies, browser session tokens, or OpenAI credentials into bridge arguments or project files. The runner obtains authorized session behavior from DevSpace rather than reimplementing browser authentication.
+Do not place ChatGPT credentials in CLI arguments, project files, or the bridge protocol.
+
+## Validation boundary
+
+The implementation includes focused mocked tests for protocol parsing, bridge behavior, DevSpace transport configuration, and child-state normalization.
+
+Stage 2 is fully proven only when all of the following are true:
+
+```text
+TypeScript typecheck passes
+        +
+focused tests pass
+        +
+DevSpace desktop exposes a real local MCP endpoint
+        +
+the endpoint exposes devspace_agent_spawn/devspace_agent_get
+        +
+a real child ChatGPT Web session modifies the intended workspace
+        +
+visible UI validation completes when requested
+```
+
+GitHub Actions on this fork has not produced a validation run for this PR yet, so CI success must not be claimed until a real run exists.
 
 ## Stage boundary
 
-What this stage now provides:
+Included in Stage 2:
 
 ```text
-OpenDesign-compatible process boundary
-        +
-version / doctor / run CLI
-        +
-structured request-event protocol
-        +
-bundled DevSpace MCP runner
-        +
+OpenDesign bridge CLI
+bundled DevSpace runner
+auditable JSONL protocol
+HTTP + stdio MCP transports
+live DevSpace tool capability probing
 ChatGPT Web child-session spawn/poll loop
 ```
 
-What it intentionally does not provide yet:
+Not included yet:
 
 ```text
 Agent Picker entry
-native OpenDesign runtime definition
-automatic DevSpace installation/configuration
+native RuntimeAgentDef
+automatic DevSpace installation
+DevSpace desktop endpoint discovery contract
 automatic DevSpace run creation
 browser-login automation
 ```
 
-Those belong to the native-product integration stage or to DevSpace product setup. Stage 2 is complete only after the focused typecheck/tests pass and one real configured DevSpace run completes an end-to-end design task in the intended workspace.
+The next product-side dependency is therefore precise: DevSpace desktop must expose or document a stable local MCP endpoint/discovery contract that an external local client such as OpenDesign can consume.
