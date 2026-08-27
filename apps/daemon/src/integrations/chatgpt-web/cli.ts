@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { stdin as processStdin, stderr as processStderr, stdout as processStdout } from 'node:process';
 import {
   doctorChatGptWebBridge,
@@ -9,7 +10,9 @@ import {
 } from './bridge.js';
 import { CHATGPT_WEB_BRIDGE_PROTOCOL } from './protocol.js';
 
-const BRIDGE_CLI_VERSION = '0.1.0';
+const BRIDGE_CLI_VERSION = '0.2.0';
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+const BUNDLED_DEVSPACE_RUNNER = resolve(MODULE_DIR, '../../../bin/od-devspace-chatgpt-runner.mjs');
 
 interface CliInput extends NodeJS.ReadableStream {
   isTTY?: boolean;
@@ -28,6 +31,10 @@ interface ParsedRunArgs {
   imagePaths: string[];
   runner?: string;
   runnerArgs: string[];
+  mcpUrl?: string;
+  mcpCommand?: string;
+  mcpArgs: string[];
+  devspaceRunId?: string;
 }
 
 function usage(): string {
@@ -41,16 +48,24 @@ Usage:
   od-chatgpt-web --version
 
 Run options:
-  --cwd <path>            Project working directory. Defaults to the current directory.
-  --prompt <text>         Prompt text. If omitted, prompt is read from stdin.
-  --prompt-file <path|->  Read the prompt from a file or stdin when path is '-'.
-  --image <path>          Attach an image path. May be repeated.
-  --runner <path>         Override OD_CHATGPT_WEB_RUNNER.
-  --runner-arg <arg>      Add a runner argument. May be repeated.
+  --cwd <path>              Project working directory. Defaults to the current directory.
+  --prompt <text>           Prompt text. If omitted, prompt is read from stdin.
+  --prompt-file <path|->    Read the prompt from a file or stdin when path is '-'.
+  --image <path>            Attach an image path. May be repeated.
+  --mcp-url <url>           DevSpace desktop local MCP bridge URL.
+  --devspace-run-id <id>    Persistent DevSpace run bound to this project.
+  --mcp-command <path>      Fallback stdio MCP server command.
+  --mcp-arg <arg>           Add one stdio MCP server argument. May be repeated.
+  --runner <path>           Override the bundled DevSpace runner.
+  --runner-arg <arg>        Add a runner argument. May be repeated.
 
-Environment:
-  OD_CHATGPT_WEB_RUNNER       DevSpace-side runner executable.
-  OD_CHATGPT_WEB_RUNNER_ARGS  JSON array of default runner arguments.
+Environment equivalents:
+  OD_DEVSPACE_MCP_URL
+  OD_DEVSPACE_RUN_ID
+  OD_DEVSPACE_MCP_COMMAND
+  OD_DEVSPACE_MCP_ARGS
+  OD_CHATGPT_WEB_RUNNER
+  OD_CHATGPT_WEB_RUNNER_ARGS
 
 Protocol:
   ${CHATGPT_WEB_BRIDGE_PROTOCOL}
@@ -76,6 +91,7 @@ function parseRunArgs(argv: string[]): ParsedRunArgs {
     cwd: process.cwd(),
     imagePaths: [],
     runnerArgs: [],
+    mcpArgs: [],
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -91,6 +107,18 @@ function parseRunArgs(argv: string[]): ParsedRunArgs {
       index += 1;
     } else if (arg === '--image') {
       parsed.imagePaths.push(resolve(requireValue(argv, index, arg)));
+      index += 1;
+    } else if (arg === '--mcp-url') {
+      parsed.mcpUrl = requireValue(argv, index, arg);
+      index += 1;
+    } else if (arg === '--devspace-run-id') {
+      parsed.devspaceRunId = requireValue(argv, index, arg);
+      index += 1;
+    } else if (arg === '--mcp-command') {
+      parsed.mcpCommand = requireValue(argv, index, arg);
+      index += 1;
+    } else if (arg === '--mcp-arg') {
+      parsed.mcpArgs.push(requireValue(argv, index, arg));
       index += 1;
     } else if (arg === '--runner') {
       parsed.runner = requireValue(argv, index, arg);
@@ -108,21 +136,35 @@ function parseRunArgs(argv: string[]): ParsedRunArgs {
   if (parsed.prompt !== undefined && parsed.promptFile !== undefined) {
     throw new Error('Use only one of --prompt or --prompt-file.');
   }
+  if (parsed.mcpUrl && parsed.mcpCommand) {
+    throw new Error('Use only one of --mcp-url or --mcp-command.');
+  }
   return parsed;
 }
 
-function runnerFromArgs(parsed: ParsedRunArgs): ChatGptWebRunnerConfig | null {
+function runnerFromArgs(parsed: ParsedRunArgs): ChatGptWebRunnerConfig {
   const fromEnv = resolveChatGptWebRunnerConfig();
-  if (!parsed.runner) {
-    if (!fromEnv) return null;
+  if (parsed.runner) {
+    return { bin: parsed.runner, args: parsed.runnerArgs };
+  }
+  if (fromEnv) {
     return parsed.runnerArgs.length > 0
       ? { bin: fromEnv.bin, args: [...fromEnv.args, ...parsed.runnerArgs] }
       : fromEnv;
   }
   return {
-    bin: parsed.runner,
-    args: parsed.runnerArgs,
+    bin: process.execPath,
+    args: [BUNDLED_DEVSPACE_RUNNER, ...parsed.runnerArgs],
   };
+}
+
+function runnerEnv(parsed: ParsedRunArgs): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  if (parsed.mcpUrl) env.OD_DEVSPACE_MCP_URL = parsed.mcpUrl;
+  if (parsed.devspaceRunId) env.OD_DEVSPACE_RUN_ID = parsed.devspaceRunId;
+  if (parsed.mcpCommand) env.OD_DEVSPACE_MCP_COMMAND = parsed.mcpCommand;
+  if (parsed.mcpArgs.length > 0) env.OD_DEVSPACE_MCP_ARGS = JSON.stringify(parsed.mcpArgs);
+  return env;
 }
 
 async function resolvePrompt(parsed: ParsedRunArgs, io: CliIo): Promise<string> {
@@ -138,12 +180,6 @@ async function resolvePrompt(parsed: ParsedRunArgs, io: CliIo): Promise<string> 
 
 async function runCommand(argv: string[], io: CliIo): Promise<number> {
   const parsed = parseRunArgs(argv);
-  const runner = runnerFromArgs(parsed);
-  if (!runner) {
-    throw new Error(
-      'No ChatGPT Web runner configured. Set OD_CHATGPT_WEB_RUNNER or pass --runner.',
-    );
-  }
   const prompt = await resolvePrompt(parsed, io);
   if (!prompt.trim()) throw new Error('Prompt is empty.');
 
@@ -151,7 +187,8 @@ async function runCommand(argv: string[], io: CliIo): Promise<number> {
     cwd: parsed.cwd,
     prompt,
     imagePaths: parsed.imagePaths,
-    runner,
+    runner: runnerFromArgs(parsed),
+    env: runnerEnv(parsed),
     onEvent: (event) => {
       io.stdout.write(`${JSON.stringify(event)}\n`);
     },
@@ -188,7 +225,7 @@ async function doctorCommand(argv: string[], io: CliIo): Promise<number> {
     ? { bin: runnerOverride, args: runnerArgs }
     : envRunner
       ? { bin: envRunner.bin, args: [...envRunner.args, ...runnerArgs] }
-      : null;
+      : { bin: process.execPath, args: [BUNDLED_DEVSPACE_RUNNER, ...runnerArgs] };
   const result = await doctorChatGptWebBridge(runner);
 
   if (json) {
