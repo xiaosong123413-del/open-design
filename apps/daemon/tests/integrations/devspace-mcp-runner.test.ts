@@ -8,28 +8,55 @@ import {
 import { CHATGPT_WEB_BRIDGE_PROTOCOL } from '../../src/integrations/chatgpt-web/protocol.js';
 
 describe('DevSpace MCP runner config', () => {
-  it('resolves the MCP command, args, run id, and timing settings', () => {
+  it('prefers the DevSpace desktop local MCP URL', () => {
     expect(
       resolveDevSpaceMcpRunnerConfig({
-        OD_DEVSPACE_MCP_COMMAND: 'devspace-mcp',
-        OD_DEVSPACE_MCP_ARGS: '["--stdio"]',
+        OD_DEVSPACE_MCP_URL: 'http://127.0.0.1:43123/mcp',
+        OD_DEVSPACE_MCP_COMMAND: 'ignored-stdio-command',
         OD_DEVSPACE_RUN_ID: 'run-123',
         OD_DEVSPACE_POLL_MS: '250',
         OD_DEVSPACE_TIMEOUT_MS: '5000',
       }),
     ).toEqual({
-      command: 'devspace-mcp',
-      args: ['--stdio'],
+      transport: { kind: 'http', url: 'http://127.0.0.1:43123/mcp' },
       runId: 'run-123',
       pollMs: 250,
       timeoutMs: 5000,
     });
   });
 
-  it('requires a persistent DevSpace run', () => {
+  it('supports an explicit stdio MCP server as a fallback', () => {
+    expect(
+      resolveDevSpaceMcpRunnerConfig({
+        OD_DEVSPACE_MCP_COMMAND: 'devspace-mcp',
+        OD_DEVSPACE_MCP_ARGS: '["--stdio"]',
+        OD_DEVSPACE_RUN_ID: 'run-123',
+      }),
+    ).toMatchObject({
+      transport: { kind: 'stdio', command: 'devspace-mcp', args: ['--stdio'] },
+      runId: 'run-123',
+    });
+  });
+
+  it('requires a real DevSpace MCP transport', () => {
     expect(() =>
-      resolveDevSpaceMcpRunnerConfig({ OD_DEVSPACE_MCP_COMMAND: 'devspace-mcp' }),
+      resolveDevSpaceMcpRunnerConfig({ OD_DEVSPACE_RUN_ID: 'run-123' }),
+    ).toThrow(/DevSpace MCP transport is not configured/u);
+  });
+
+  it('requires a persistent DevSpace run binding', () => {
+    expect(() =>
+      resolveDevSpaceMcpRunnerConfig({ OD_DEVSPACE_MCP_URL: 'http://127.0.0.1:43123/mcp' }),
     ).toThrow(/OD_DEVSPACE_RUN_ID/u);
+  });
+
+  it('rejects invalid MCP URLs', () => {
+    expect(() =>
+      resolveDevSpaceMcpRunnerConfig({
+        OD_DEVSPACE_MCP_URL: 'file:///tmp/devspace',
+        OD_DEVSPACE_RUN_ID: 'run-123',
+      }),
+    ).toThrow(/must use http or https/u);
   });
 
   it('rejects non-array MCP args', () => {
