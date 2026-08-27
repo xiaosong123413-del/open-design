@@ -2,13 +2,14 @@ import { resolve } from 'node:path';
 import { stdin as processStdin, stderr as processStderr, stdout as processStdout } from 'node:process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import {
   CHATGPT_WEB_BRIDGE_PROTOCOL,
   type ChatGptWebRunRequest,
   type ChatGptWebBridgeEvent,
 } from './protocol.js';
 
-const RUNNER_VERSION = '0.1.0';
+const RUNNER_VERSION = '0.2.0';
 const DEFAULT_POLL_MS = 2_000;
 const DEFAULT_TIMEOUT_MS = 30 * 60_000;
 
@@ -20,9 +21,12 @@ interface RunnerIo {
   stderr: NodeJS.WritableStream;
 }
 
+type DevSpaceMcpTransportConfig =
+  | { kind: 'http'; url: string }
+  | { kind: 'stdio'; command: string; args: string[] };
+
 export interface DevSpaceMcpRunnerConfig {
-  command: string;
-  args: string[];
+  transport: DevSpaceMcpTransportConfig;
   runId: string;
   pollMs: number;
   timeoutMs: number;
@@ -57,20 +61,47 @@ function parsePositiveInteger(value: string | undefined, fallback: number, name:
   return parsed;
 }
 
+function validateMcpUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error('OD_DEVSPACE_MCP_URL must be a valid http(s) URL.');
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('OD_DEVSPACE_MCP_URL must use http or https.');
+  }
+  return url.toString();
+}
+
 export function resolveDevSpaceMcpRunnerConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): DevSpaceMcpRunnerConfig {
+  const mcpUrl = env.OD_DEVSPACE_MCP_URL?.trim();
   const command = env.OD_DEVSPACE_MCP_COMMAND?.trim();
-  if (!command) throw new Error('OD_DEVSPACE_MCP_COMMAND is not configured.');
+  if (!mcpUrl && !command) {
+    throw new Error(
+      'DevSpace MCP transport is not configured. Prefer OD_DEVSPACE_MCP_URL for the DevSpace desktop local bridge; use OD_DEVSPACE_MCP_COMMAND only when an explicit stdio server command is available.',
+    );
+  }
+
   const runId = env.OD_DEVSPACE_RUN_ID?.trim();
   if (!runId) {
     throw new Error(
-      'OD_DEVSPACE_RUN_ID is not configured. Create or choose a persistent DevSpace run for this project first.',
+      'OD_DEVSPACE_RUN_ID is not configured. Bind this OpenDesign project to one persistent DevSpace run first; the run id is project binding state, not a per-prompt value.',
     );
   }
+
+  const transport: DevSpaceMcpTransportConfig = mcpUrl
+    ? { kind: 'http', url: validateMcpUrl(mcpUrl) }
+    : {
+        kind: 'stdio',
+        command: command as string,
+        args: parseJsonArray(env.OD_DEVSPACE_MCP_ARGS, 'OD_DEVSPACE_MCP_ARGS'),
+      };
+
   return {
-    command,
-    args: parseJsonArray(env.OD_DEVSPACE_MCP_ARGS, 'OD_DEVSPACE_MCP_ARGS'),
+    transport,
     runId,
     pollMs: parsePositiveInteger(env.OD_DEVSPACE_POLL_MS, DEFAULT_POLL_MS, 'OD_DEVSPACE_POLL_MS'),
     timeoutMs: parsePositiveInteger(
@@ -179,7 +210,6 @@ export function classifyAgentState(value: unknown): 'working' | 'completed' | 'f
   if (status && ['waiting', 'needs_input', 'blocked', 'paused'].includes(status)) {
     return 'waiting';
   }
-
   if (isRecord(normalized) && normalized.result !== undefined && normalized.result !== null) {
     return 'completed';
   }
@@ -224,29 +254,61 @@ async function callTool(client: Client, name: string, args: JsonRecord): Promise
   return parseTextContent(result);
 }
 
+function toolAcceptsProperty(tool: { inputSchema?: unknown }, property: string): boolean {
+  if (!isRecord(tool.inputSchema)) return false;
+  const properties = tool.inputSchema.properties;
+  return isRecord(properties) && Object.prototype.hasOwnProperty.call(properties, property);
+}
+
+function buildSpawnArgs(
+  runId: string,
+  task: string,
+  spawnTool: { inputSchema?: unknown },
+): JsonRecord {
+  const args: JsonRecord = { runId, role: 'implementer', task };
+  if (toolAcceptsProperty(spawnTool, 'name')) args.name = 'OpenDesign ChatGPT Web';
+  if (toolAcceptsProperty(spawnTool, 'acceptanceCriteria')) {
+    args.acceptanceCriteria = [
+      'Implement the requested design or application change in the bound project workspace.',
+      'Run relevant validation when practical and report failures instead of hiding them.',
+      'Inspect visible UI changes in a real browser preview when practical.',
+    ];
+  }
+  if (toolAcceptsProperty(spawnTool, 'workspaceMode')) args.workspaceMode = 'shared';
+  return args;
+}
+
+function createTransport(config: DevSpaceMcpTransportConfig) {
+  if (config.kind === 'http') {
+    return new StreamableHTTPClientTransport(new URL(config.url));
+  }
+  return new StdioClientTransport({ command: config.command, args: config.args });
+}
+
 export async function runDevSpaceMcpRunner(
   request: ChatGptWebRunRequest,
   config: DevSpaceMcpRunnerConfig,
   io: RunnerIo,
 ): Promise<void> {
   const client = new Client({ name: 'open-design-chatgpt-web-runner', version: RUNNER_VERSION });
-  const transport = new StdioClientTransport({ command: config.command, args: config.args });
+  const transport = createTransport(config.transport);
 
   try {
     emit(io, {
       protocol: CHATGPT_WEB_BRIDGE_PROTOCOL,
       type: 'status',
       requestId: request.requestId,
-      message: 'Connecting to DevSpace MCP',
+      message: `Connecting to DevSpace MCP via ${config.transport.kind}`,
     });
     await client.connect(transport);
 
     const listed = await client.listTools();
-    const names = new Set(listed.tools.map((tool) => tool.name));
-    for (const required of ['devspace_agent_spawn', 'devspace_agent_get']) {
-      if (!names.has(required)) {
-        throw new Error(`DevSpace MCP server does not expose required tool: ${required}`);
-      }
+    const spawnTool = listed.tools.find((tool) => tool.name === 'devspace_agent_spawn');
+    const getTool = listed.tools.find((tool) => tool.name === 'devspace_agent_get');
+    if (!spawnTool || !getTool) {
+      throw new Error(
+        'Connected MCP server is not the DevSpace bridge: required tools devspace_agent_spawn/devspace_agent_get were not both exposed.',
+      );
     }
 
     emit(io, {
@@ -256,18 +318,11 @@ export async function runDevSpaceMcpRunner(
       message: 'Starting ChatGPT Web design session',
     });
 
-    const spawnResult = await callTool(client, 'devspace_agent_spawn', {
-      runId: config.runId,
-      role: 'implementer',
-      name: 'OpenDesign ChatGPT Web',
-      task: taskText(request),
-      acceptanceCriteria: [
-        'The requested design or application change is implemented in the target project workspace.',
-        'Relevant validation is run when practical and failures are reported instead of hidden.',
-        'Visible UI changes are inspected in a real browser preview when practical.',
-      ],
-      workspaceMode: 'shared',
-    });
+    const spawnResult = await callTool(
+      client,
+      'devspace_agent_spawn',
+      buildSpawnArgs(config.runId, taskText(request), spawnTool),
+    );
 
     const agentId = findStringByKeys(spawnResult, ['agentId', 'agent_id', 'id']);
     if (!agentId) throw new Error('DevSpace did not return an agentId from devspace_agent_spawn.');
@@ -311,24 +366,23 @@ export async function runDevSpaceMcpRunner(
           'result_summary',
           'message',
         ]);
-        const summary = reportedSummary ?? (lastReply || 'DevSpace ChatGPT Web task completed.');
         emit(io, {
           protocol: CHATGPT_WEB_BRIDGE_PROTOCOL,
           type: 'done',
           requestId: request.requestId,
-          summary,
+          summary: reportedSummary ?? (lastReply || 'DevSpace ChatGPT Web task completed.'),
         });
         return;
       }
       if (state === 'failed') {
-        const message =
-          findStringByKeys(agent, ['error', 'message', 'summary']) ?? 'DevSpace ChatGPT Web task failed.';
         emit(io, {
           protocol: CHATGPT_WEB_BRIDGE_PROTOCOL,
           type: 'error',
           requestId: request.requestId,
           code: 'DEVSPACE_AGENT_FAILED',
-          message,
+          message:
+            findStringByKeys(agent, ['error', 'message', 'summary']) ??
+            'DevSpace ChatGPT Web task failed.',
           recoverable: false,
         });
         return;
@@ -350,7 +404,7 @@ export async function runDevSpaceMcpRunner(
 }
 
 function usage(): string {
-  return `od-devspace-chatgpt-runner ${RUNNER_VERSION}\n\nReads one od-chatgpt-web/1 run request from stdin and executes it through an existing DevSpace run.\n\nEnvironment:\n  OD_DEVSPACE_MCP_COMMAND   Command that starts the local DevSpace MCP server.\n  OD_DEVSPACE_MCP_ARGS      Optional JSON array of MCP server arguments.\n  OD_DEVSPACE_RUN_ID        Existing persistent DevSpace run bound to this project.\n  OD_DEVSPACE_POLL_MS       Optional poll interval; default ${DEFAULT_POLL_MS}.\n  OD_DEVSPACE_TIMEOUT_MS    Optional timeout; default ${DEFAULT_TIMEOUT_MS}.\n`;
+  return `od-devspace-chatgpt-runner ${RUNNER_VERSION}\n\nReads one od-chatgpt-web/1 run request from stdin and executes it through an existing DevSpace run.\n\nEnvironment:\n  OD_DEVSPACE_MCP_URL       Preferred: DevSpace desktop local MCP bridge URL.\n  OD_DEVSPACE_MCP_COMMAND   Fallback: explicit stdio MCP server command.\n  OD_DEVSPACE_MCP_ARGS      Optional JSON array for the stdio command.\n  OD_DEVSPACE_RUN_ID        Persistent DevSpace run bound to this OpenDesign project.\n  OD_DEVSPACE_POLL_MS       Optional poll interval; default ${DEFAULT_POLL_MS}.\n  OD_DEVSPACE_TIMEOUT_MS    Optional timeout; default ${DEFAULT_TIMEOUT_MS}.\n`;
 }
 
 export async function main(
