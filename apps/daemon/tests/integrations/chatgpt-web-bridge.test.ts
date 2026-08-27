@@ -33,16 +33,16 @@ describe('ChatGPT Web bridge protocol', () => {
 
 describe('runChatGptWebBridge', () => {
   it('sends one run request and streams runner events', async () => {
-    const runnerScript = String.raw`
+    const runnerScript = `
       let input = '';
       process.stdin.setEncoding('utf8');
       process.stdin.on('data', (chunk) => { input += chunk; });
       process.stdin.on('end', () => {
         const request = JSON.parse(input.trim());
         const base = { protocol: request.protocol, requestId: request.requestId };
-        process.stdout.write(JSON.stringify({ ...base, type: 'status', message: 'connected' }) + '\n');
-        process.stdout.write(JSON.stringify({ ...base, type: 'text', text: 'working' }) + '\n');
-        process.stdout.write(JSON.stringify({ ...base, type: 'done', summary: 'finished' }) + '\n');
+        process.stdout.write(JSON.stringify({ ...base, type: 'status', message: 'connected' }) + '\\n');
+        process.stdout.write(JSON.stringify({ ...base, type: 'text', text: 'working' }) + '\\n');
+        process.stdout.write(JSON.stringify({ ...base, type: 'done', summary: 'finished' }) + '\\n');
       });
     `;
     const events: string[] = [];
@@ -60,7 +60,7 @@ describe('runChatGptWebBridge', () => {
   });
 
   it('rejects a runner that never emits a terminal event', async () => {
-    const runnerScript = String.raw`
+    const runnerScript = `
       let input = '';
       process.stdin.setEncoding('utf8');
       process.stdin.on('data', (chunk) => { input += chunk; });
@@ -71,7 +71,7 @@ describe('runChatGptWebBridge', () => {
           requestId: request.requestId,
           type: 'status',
           message: 'connected'
-        }) + '\n');
+        }) + '\\n');
       });
     `;
 
