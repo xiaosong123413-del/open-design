@@ -77,8 +77,11 @@ const residualAllowedExactPaths = new Set([
   // executed directly by Node and are not loaded by the app runtime.
   "scripts/import-prompt-templates.mjs",
   "scripts/postinstall.mjs",
-  // Checked-in bin shim so pnpm can link `od` before daemon dist output exists.
+  // Checked-in bin shims so pnpm can link daemon CLIs before dist output exists.
+  // They remain .mjs because package.json `bin` entries must be directly executable by Node.
   "apps/daemon/bin/od.mjs",
+  "apps/daemon/bin/od-chatgpt-web.mjs",
+  "apps/daemon/bin/od-devspace-chatgpt-runner.mjs",
   "apps/packaged/esbuild.config.mjs",
   // Browser service workers must be served as JavaScript files.
   "apps/web/public/od-notifications-sw.js",

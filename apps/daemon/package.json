@@ -6,7 +6,9 @@
   "main": "./dist/cli.js",
   "types": "./dist/cli.d.ts",
   "bin": {
-    "od": "./bin/od.mjs"
+    "od": "./bin/od.mjs",
+    "od-chatgpt-web": "./bin/od-chatgpt-web.mjs",
+    "od-devspace-chatgpt-runner": "./bin/od-devspace-chatgpt-runner.mjs"
   },
   "exports": {
     ".": {
