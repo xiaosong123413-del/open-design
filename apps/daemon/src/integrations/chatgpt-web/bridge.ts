@@ -125,7 +125,9 @@ export async function runChatGptWebBridge(
   });
 
   const lineReader = createInterface({ input: child.stdout, crlfDelay: Infinity });
-  let terminalEvent: Extract<ChatGptWebBridgeEvent, { type: 'done' | 'error' }> | null = null;
+  const terminalEventRef: {
+    value: Extract<ChatGptWebBridgeEvent, { type: 'done' | 'error' }> | null;
+  } = { value: null };
   let streamError: Error | null = null;
 
   const consumeOutput = (async () => {
@@ -141,7 +143,7 @@ export async function runChatGptWebBridge(
         }
         options.onEvent?.(event);
         if (isTerminalChatGptWebBridgeEvent(event)) {
-          terminalEvent = event;
+          terminalEventRef.value = event;
         }
       }
     } catch (error) {
@@ -158,6 +160,7 @@ export async function runChatGptWebBridge(
 
   if (spawnError) throw spawnError;
   if (streamError) throw streamError;
+  const terminalEvent = terminalEventRef.value;
   if (!terminalEvent) {
     throw new Error(
       `ChatGPT Web runner exited with code ${exitCode} without a terminal done/error event.`,

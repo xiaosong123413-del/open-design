@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   classifyAgentState,
+  discoverDevSpaceMcpUrl,
   findStringByKeys,
   parseBridgeRequest,
   resolveDevSpaceMcpRunnerConfig,
@@ -8,17 +9,17 @@ import {
 import { CHATGPT_WEB_BRIDGE_PROTOCOL } from '../../src/integrations/chatgpt-web/protocol.js';
 
 describe('DevSpace MCP runner config', () => {
-  it('prefers the DevSpace desktop local MCP URL', () => {
+  it('uses an explicit DevSpace MCP URL when configured', () => {
     expect(
       resolveDevSpaceMcpRunnerConfig({
         OD_DEVSPACE_MCP_URL: 'http://127.0.0.1:43123/mcp',
-        OD_DEVSPACE_MCP_COMMAND: 'ignored-stdio-command',
+        OD_DEVSPACE_ACCESS_TOKEN: 'access-token',
         OD_DEVSPACE_RUN_ID: 'run-123',
         OD_DEVSPACE_POLL_MS: '250',
         OD_DEVSPACE_TIMEOUT_MS: '5000',
       }),
     ).toEqual({
-      transport: { kind: 'http', url: 'http://127.0.0.1:43123/mcp' },
+      transport: { kind: 'http', url: 'http://127.0.0.1:43123/mcp', accessToken: 'access-token' },
       runId: 'run-123',
       pollMs: 250,
       timeoutMs: 5000,
@@ -38,10 +39,14 @@ describe('DevSpace MCP runner config', () => {
     });
   });
 
-  it('requires a real DevSpace MCP transport', () => {
-    expect(() =>
-      resolveDevSpaceMcpRunnerConfig({ OD_DEVSPACE_RUN_ID: 'run-123' }),
-    ).toThrow(/DevSpace MCP transport is not configured/u);
+  it('defaults to the DevSpace desktop control status discovery endpoint', () => {
+    expect(resolveDevSpaceMcpRunnerConfig({ OD_DEVSPACE_RUN_ID: 'run-123' })).toMatchObject({
+      transport: {
+        kind: 'discover',
+        controlStatusUrl: 'http://127.0.0.1:7676/control/status',
+      },
+      runId: 'run-123',
+    });
   });
 
   it('requires a persistent DevSpace run binding', () => {
@@ -50,13 +55,29 @@ describe('DevSpace MCP runner config', () => {
     ).toThrow(/OD_DEVSPACE_RUN_ID/u);
   });
 
-  it('rejects invalid MCP URLs', () => {
+  it('rejects invalid MCP and discovery URLs', () => {
     expect(() =>
       resolveDevSpaceMcpRunnerConfig({
         OD_DEVSPACE_MCP_URL: 'file:///tmp/devspace',
         OD_DEVSPACE_RUN_ID: 'run-123',
       }),
     ).toThrow(/must use http or https/u);
+    expect(() =>
+      resolveDevSpaceMcpRunnerConfig({
+        OD_DEVSPACE_CONTROL_STATUS_URL: 'file:///tmp/devspace-status',
+        OD_DEVSPACE_RUN_ID: 'run-123',
+      }),
+    ).toThrow(/OD_DEVSPACE_CONTROL_STATUS_URL must use http or https/u);
+  });
+
+  it('rejects configuring HTTP and stdio transports together', () => {
+    expect(() =>
+      resolveDevSpaceMcpRunnerConfig({
+        OD_DEVSPACE_MCP_URL: 'http://127.0.0.1:43123/mcp',
+        OD_DEVSPACE_MCP_COMMAND: 'devspace-mcp',
+        OD_DEVSPACE_RUN_ID: 'run-123',
+      }),
+    ).toThrow(/only one DevSpace MCP transport/u);
   });
 
   it('rejects non-array MCP args', () => {
@@ -67,6 +88,35 @@ describe('DevSpace MCP runner config', () => {
         OD_DEVSPACE_RUN_ID: 'run-123',
       }),
     ).toThrow(/OD_DEVSPACE_MCP_ARGS must be a JSON string array/u);
+  });
+});
+
+describe('DevSpace MCP endpoint discovery', () => {
+  it('reads the real endpoint shape from DevSpace control status', async () => {
+    const fetchFn = async (): Promise<Response> => new Response(
+      JSON.stringify({ status: 'ok', mcpUrl: 'https://devspace.example.test/mcp' }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+
+    await expect(
+      discoverDevSpaceMcpUrl('http://127.0.0.1:7676/control/status', fetchFn),
+    ).resolves.toBe('https://devspace.example.test/mcp');
+  });
+
+  it('rejects missing mcpUrl and failed control status responses', async () => {
+    await expect(
+      discoverDevSpaceMcpUrl(
+        'http://127.0.0.1:7676/control/status',
+        async () => new Response(JSON.stringify({ status: 'ok' }), { status: 200 }),
+      ),
+    ).rejects.toThrow(/did not provide a non-empty mcpUrl/u);
+
+    await expect(
+      discoverDevSpaceMcpUrl(
+        'http://127.0.0.1:7676/control/status',
+        async () => new Response('offline', { status: 503 }),
+      ),
+    ).rejects.toThrow(/HTTP 503/u);
   });
 });
 

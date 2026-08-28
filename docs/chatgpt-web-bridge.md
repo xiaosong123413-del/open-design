@@ -51,29 +51,40 @@ pnpm exec od-devspace-chatgpt-runner --version
 
 ## One-time project binding
 
-Two pieces of DevSpace state are required for Stage 2:
+One persistent DevSpace run must already be bound to the intended project workspace. The MCP endpoint itself is discovered from the running DevSpace desktop backend by default.
 
-1. the local MCP bridge URL exposed by DevSpace desktop;
-2. one persistent DevSpace run already bound to the intended project workspace.
+The current desktop contract is:
 
-They can be supplied as environment configuration:
+```text
+GET http://127.0.0.1:7676/control/status
+        |
+        +--> mcpUrl
+```
+
+The returned `mcpUrl` is the authoritative Streamable HTTP MCP resource. An explicit URL remains available as an override when the desktop control endpoint is relocated.
+
+Project binding can be supplied as environment configuration:
 
 ```bash
-export OD_DEVSPACE_MCP_URL='<DevSpace desktop local MCP URL>'
 export OD_DEVSPACE_RUN_ID='<persistent run id>'
 ```
 
-or directly on one invocation:
+Optional transport overrides:
+
+```bash
+export OD_DEVSPACE_CONTROL_STATUS_URL='http://127.0.0.1:7676/control/status'
+export OD_DEVSPACE_MCP_URL='<explicit DevSpace MCP URL>'
+```
+
+or directly on one invocation when an explicit MCP URL is required:
 
 ```bash
 pnpm exec od-chatgpt-web run \
   --cwd /path/to/project \
-  --mcp-url '<DevSpace desktop local MCP URL>' \
+  --mcp-url '<explicit DevSpace MCP URL>' \
   --devspace-run-id '<persistent run id>' \
   --prompt 'Design a settings page and verify it in the browser preview.'
 ```
-
-The MCP URL is intentionally not guessed. OpenDesign must use the endpoint actually exposed by the installed DevSpace desktop build.
 
 If a DevSpace build explicitly exposes an MCP stdio command instead of a local URL, use the compatibility path:
 
@@ -86,9 +97,21 @@ pnpm exec od-chatgpt-web run \
   --prompt 'Design a dashboard.'
 ```
 
+## OAuth authentication
+
+The discovered DevSpace MCP resource is OAuth-protected. OpenDesign must not bypass that protection or read DevSpace's owner-password file. The runner accepts `OD_DEVSPACE_ACCESS_TOKEN` only for a bearer token that has already been issued through DevSpace's normal OAuth authorization flow:
+
+```bash
+export OD_DEVSPACE_ACCESS_TOKEN='<already-authorized bearer token>'
+```
+
+The access token is environment-only. Do not put the DevSpace Owner password, ChatGPT cookies, bearer tokens, or refresh tokens in CLI arguments, project files, or the bridge JSONL protocol.
+
+Interactive OAuth acquisition and secure token persistence are not implemented by this Stage 2 runner yet. Until the product surface owns that flow, a caller must provide an already-authorized bearer token.
+
 ## Normal design use
 
-After the project binding is stored by the calling OpenDesign surface, normal use should collapse to:
+After the project binding and OAuth authorization are stored by the calling OpenDesign surface, normal use should collapse to:
 
 ```bash
 pnpm exec od-chatgpt-web run \
@@ -102,12 +125,13 @@ The product UI should own the one-time MCP URL / DevSpace run binding. Users sho
 
 For each invocation it:
 
-1. connects to DevSpace via the configured local MCP URL, or explicit stdio fallback;
-2. calls `tools/list` and requires `devspace_agent_spawn` plus `devspace_agent_get`;
-3. inspects the live `devspace_agent_spawn` input schema before adding optional arguments, avoiding hard-coded optional fields that a different DevSpace build may not support;
-4. starts an `implementer` ChatGPT Web child session inside the bound persistent run;
-5. polls the child session, streaming new observed replies as bridge `text` events;
-6. emits `done` or `error` when DevSpace reaches terminal state.
+1. discovers the DevSpace MCP URL from the local desktop control status endpoint unless an explicit URL or stdio transport is configured;
+2. connects through Streamable HTTP using an already-authorized bearer token when supplied, or through the explicit stdio fallback;
+3. calls `tools/list` and requires `devspace_agent_spawn` plus `devspace_agent_get`;
+4. inspects the live `devspace_agent_spawn` input schema before adding optional arguments, avoiding hard-coded optional fields that a different DevSpace build may not support;
+5. starts an `implementer` ChatGPT Web child session inside the bound persistent run;
+6. polls the child session, streaming new observed replies as bridge `text` events;
+7. emits `done` or `error` when DevSpace reaches terminal state.
 
 The request `cwd` is included in the child task for verification and context. It does not silently rebind a DevSpace run to another project.
 
@@ -131,9 +155,9 @@ Supported event types are `session`, `status`, `text`, `tool`, `artifact`, `prev
 
 ## Security boundary
 
-OpenDesign never needs ChatGPT cookies, browser session tokens, or an OpenAI API key for this path. DevSpace remains responsible for ChatGPT session ownership, local permission gates, filesystem access, commands, browser inspection, and authentication.
+OpenDesign never needs ChatGPT cookies, browser session tokens, or an OpenAI API key for this path. DevSpace remains responsible for ChatGPT session ownership, local permission gates, filesystem access, commands, browser inspection, and OAuth authorization.
 
-Do not place ChatGPT credentials in CLI arguments, project files, or the bridge protocol.
+The OpenDesign runner may receive an already-issued DevSpace bearer token through its process environment. It does not consume the DevSpace Owner password and must not read DevSpace credential stores directly.
 
 ## Validation boundary
 
@@ -176,9 +200,9 @@ Not included yet:
 Agent Picker entry
 native RuntimeAgentDef
 automatic DevSpace installation
-DevSpace desktop endpoint discovery contract
+interactive OAuth authorization/token persistence
 automatic DevSpace run creation
 browser-login automation
 ```
 
-The next product-side dependency is therefore precise: DevSpace desktop must expose or document a stable local MCP endpoint/discovery contract that an external local client such as OpenDesign can consume.
+The desktop endpoint discovery contract is now implemented against the running DevSpace control-status mechanism. The remaining product-side prerequisites for a no-setup Stage 2 flow are interactive OAuth ownership and creation/persistence of a DevSpace run bound to the exact OpenDesign project workspace.

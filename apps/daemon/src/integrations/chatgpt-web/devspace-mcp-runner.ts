@@ -3,15 +3,17 @@ import { stdin as processStdin, stderr as processStderr, stdout as processStdout
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import {
   CHATGPT_WEB_BRIDGE_PROTOCOL,
   type ChatGptWebRunRequest,
   type ChatGptWebBridgeEvent,
 } from './protocol.js';
 
-const RUNNER_VERSION = '0.2.0';
+const RUNNER_VERSION = '0.3.0';
 const DEFAULT_POLL_MS = 2_000;
 const DEFAULT_TIMEOUT_MS = 30 * 60_000;
+const DEFAULT_CONTROL_STATUS_URL = 'http://127.0.0.1:7676/control/status';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -22,7 +24,8 @@ interface RunnerIo {
 }
 
 type DevSpaceMcpTransportConfig =
-  | { kind: 'http'; url: string }
+  | { kind: 'http'; url: string; accessToken?: string }
+  | { kind: 'discover'; controlStatusUrl: string; accessToken?: string }
   | { kind: 'stdio'; command: string; args: string[] };
 
 export interface DevSpaceMcpRunnerConfig {
@@ -61,17 +64,37 @@ function parsePositiveInteger(value: string | undefined, fallback: number, name:
   return parsed;
 }
 
-function validateMcpUrl(value: string): string {
+function validateHttpUrl(value: string, name: string): string {
   let url: URL;
   try {
     url = new URL(value);
   } catch {
-    throw new Error('OD_DEVSPACE_MCP_URL must be a valid http(s) URL.');
+    throw new Error(`${name} must be a valid http(s) URL.`);
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error('OD_DEVSPACE_MCP_URL must use http or https.');
+    throw new Error(`${name} must use http or https.`);
   }
   return url.toString();
+}
+
+export async function discoverDevSpaceMcpUrl(
+  controlStatusUrl: string,
+  fetchFn: typeof fetch = fetch,
+): Promise<string> {
+  const response = await fetchFn(controlStatusUrl, {
+    method: 'GET',
+    headers: { accept: 'application/json' },
+  });
+  if (!response.ok) {
+    throw new Error(
+      `DevSpace control status discovery failed with HTTP ${response.status} at ${controlStatusUrl}.`,
+    );
+  }
+  const body: unknown = await response.json();
+  if (!isRecord(body) || typeof body.mcpUrl !== 'string' || !body.mcpUrl.trim()) {
+    throw new Error('DevSpace control status did not provide a non-empty mcpUrl.');
+  }
+  return validateHttpUrl(body.mcpUrl.trim(), 'DevSpace control status mcpUrl');
 }
 
 export function resolveDevSpaceMcpRunnerConfig(
@@ -79,10 +102,9 @@ export function resolveDevSpaceMcpRunnerConfig(
 ): DevSpaceMcpRunnerConfig {
   const mcpUrl = env.OD_DEVSPACE_MCP_URL?.trim();
   const command = env.OD_DEVSPACE_MCP_COMMAND?.trim();
-  if (!mcpUrl && !command) {
-    throw new Error(
-      'DevSpace MCP transport is not configured. Prefer OD_DEVSPACE_MCP_URL for the DevSpace desktop local bridge; use OD_DEVSPACE_MCP_COMMAND only when an explicit stdio server command is available.',
-    );
+  const accessToken = env.OD_DEVSPACE_ACCESS_TOKEN?.trim() || undefined;
+  if (mcpUrl && command) {
+    throw new Error('Configure only one DevSpace MCP transport: OD_DEVSPACE_MCP_URL or OD_DEVSPACE_MCP_COMMAND.');
   }
 
   const runId = env.OD_DEVSPACE_RUN_ID?.trim();
@@ -93,12 +115,21 @@ export function resolveDevSpaceMcpRunnerConfig(
   }
 
   const transport: DevSpaceMcpTransportConfig = mcpUrl
-    ? { kind: 'http', url: validateMcpUrl(mcpUrl) }
-    : {
-        kind: 'stdio',
-        command: command as string,
-        args: parseJsonArray(env.OD_DEVSPACE_MCP_ARGS, 'OD_DEVSPACE_MCP_ARGS'),
-      };
+    ? { kind: 'http', url: validateHttpUrl(mcpUrl, 'OD_DEVSPACE_MCP_URL'), ...(accessToken ? { accessToken } : {}) }
+    : command
+      ? {
+          kind: 'stdio',
+          command,
+          args: parseJsonArray(env.OD_DEVSPACE_MCP_ARGS, 'OD_DEVSPACE_MCP_ARGS'),
+        }
+      : {
+          kind: 'discover',
+          controlStatusUrl: validateHttpUrl(
+            env.OD_DEVSPACE_CONTROL_STATUS_URL?.trim() || DEFAULT_CONTROL_STATUS_URL,
+            'OD_DEVSPACE_CONTROL_STATUS_URL',
+          ),
+          ...(accessToken ? { accessToken } : {}),
+        };
 
   return {
     transport,
@@ -278,11 +309,37 @@ function buildSpawnArgs(
   return args;
 }
 
-function createTransport(config: DevSpaceMcpTransportConfig) {
+async function resolveTransportConfig(
+  config: DevSpaceMcpTransportConfig,
+): Promise<Exclude<DevSpaceMcpTransportConfig, { kind: 'discover' }>> {
+  if (config.kind !== 'discover') return config;
+  const url = await discoverDevSpaceMcpUrl(config.controlStatusUrl);
+  return {
+    kind: 'http',
+    url,
+    ...(config.accessToken ? { accessToken: config.accessToken } : {}),
+  };
+}
+
+function createTransport(config: Exclude<DevSpaceMcpTransportConfig, { kind: 'discover' }>) {
   if (config.kind === 'http') {
-    return new StreamableHTTPClientTransport(new URL(config.url));
+    return new StreamableHTTPClientTransport(
+      new URL(config.url),
+      config.accessToken
+        ? { requestInit: { headers: { authorization: `Bearer ${config.accessToken}` } } }
+        : undefined,
+    );
   }
   return new StdioClientTransport({ command: config.command, args: config.args });
+}
+
+function isMcpTransport(value: unknown): value is Transport {
+  if (typeof value !== 'object' || value === null) return false;
+  return (
+    typeof Reflect.get(value, 'start') === 'function' &&
+    typeof Reflect.get(value, 'send') === 'function' &&
+    typeof Reflect.get(value, 'close') === 'function'
+  );
 }
 
 export async function runDevSpaceMcpRunner(
@@ -291,15 +348,27 @@ export async function runDevSpaceMcpRunner(
   io: RunnerIo,
 ): Promise<void> {
   const client = new Client({ name: 'open-design-chatgpt-web-runner', version: RUNNER_VERSION });
-  const transport = createTransport(config.transport);
+  const transportConfig = await resolveTransportConfig(config.transport);
+  const transport = createTransport(transportConfig);
 
   try {
+    if (config.transport.kind === 'discover') {
+      emit(io, {
+        protocol: CHATGPT_WEB_BRIDGE_PROTOCOL,
+        type: 'status',
+        requestId: request.requestId,
+        message: `Discovered DevSpace MCP endpoint ${transportConfig.kind === 'http' ? transportConfig.url : '<unknown>'}`,
+      });
+    }
     emit(io, {
       protocol: CHATGPT_WEB_BRIDGE_PROTOCOL,
       type: 'status',
       requestId: request.requestId,
-      message: `Connecting to DevSpace MCP via ${config.transport.kind}`,
+      message: `Connecting to DevSpace MCP via ${transportConfig.kind}`,
     });
+    if (!isMcpTransport(transport)) {
+      throw new Error('Resolved DevSpace MCP transport does not implement the MCP transport contract.');
+    }
     await client.connect(transport);
 
     const listed = await client.listTools();
@@ -404,7 +473,7 @@ export async function runDevSpaceMcpRunner(
 }
 
 function usage(): string {
-  return `od-devspace-chatgpt-runner ${RUNNER_VERSION}\n\nReads one od-chatgpt-web/1 run request from stdin and executes it through an existing DevSpace run.\n\nEnvironment:\n  OD_DEVSPACE_MCP_URL       Preferred: DevSpace desktop local MCP bridge URL.\n  OD_DEVSPACE_MCP_COMMAND   Fallback: explicit stdio MCP server command.\n  OD_DEVSPACE_MCP_ARGS      Optional JSON array for the stdio command.\n  OD_DEVSPACE_RUN_ID        Persistent DevSpace run bound to this OpenDesign project.\n  OD_DEVSPACE_POLL_MS       Optional poll interval; default ${DEFAULT_POLL_MS}.\n  OD_DEVSPACE_TIMEOUT_MS    Optional timeout; default ${DEFAULT_TIMEOUT_MS}.\n`;
+  return `od-devspace-chatgpt-runner ${RUNNER_VERSION}\n\nReads one od-chatgpt-web/1 run request from stdin and executes it through an existing DevSpace run.\n\nEnvironment:\n  OD_DEVSPACE_MCP_URL              Optional explicit DevSpace MCP URL.\n  OD_DEVSPACE_CONTROL_STATUS_URL   Optional discovery endpoint; default ${DEFAULT_CONTROL_STATUS_URL}.\n  OD_DEVSPACE_ACCESS_TOKEN         Optional bearer token for an already-authorized DevSpace OAuth client.\n  OD_DEVSPACE_MCP_COMMAND          Fallback: explicit stdio MCP server command.\n  OD_DEVSPACE_MCP_ARGS             Optional JSON array for the stdio command.\n  OD_DEVSPACE_RUN_ID               Persistent DevSpace run bound to this OpenDesign project.\n  OD_DEVSPACE_POLL_MS              Optional poll interval; default ${DEFAULT_POLL_MS}.\n  OD_DEVSPACE_TIMEOUT_MS           Optional timeout; default ${DEFAULT_TIMEOUT_MS}.\n`;
 }
 
 export async function main(
